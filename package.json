@@ -1,0 +1,36 @@
+{
+  "name": "quercus-mcp",
+  "version": "1.0.0",
+  "description": "MCP server connecting Claude to University of Toronto's Quercus (Canvas LMS)",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "canvas-lms",
+    "quercus",
+    "university-of-toronto"
+  ],
+  "author": "Lance Li",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lance-lii/quercus-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2"
+  }
+}

@@ -140,18 +140,158 @@ server.registerTool(
   }
 );
 
+// --- list_files -------------------------------------------------------------
+// Most Quercus courses hide the Files tab, so /courses/:id/files returns 403.
+// The material is still reachable three ways, and this tool reads all of them:
+//   1. the Files index (when the instructor leaves it open)
+//   2. File items inside Modules
+//   3. file links written into page bodies and the syllabus
+// Per-file lookups stay authorised even when the index is not.
+
+const FILE_LINK = /\/(?:courses\/(\d+)\/)?files\/(\d+)/g;
+
+async function tryGet<T>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn();
+  } catch {
+    return null;
+  }
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+function slimFile(f: any, found_via: string, module?: string) {
+  return {
+    id: f.id,
+    display_name: f.display_name ?? f.filename,
+    size: f.size,
+    "content-type": f["content-type"],
+    mime_class: f.mime_class,
+    updated_at: f.updated_at,
+    locked_for_user: f.locked_for_user,
+    url: f.url,
+    found_via,
+    ...(module ? { module } : {}),
+  };
+}
+
 server.registerTool(
   "list_files",
   {
     title: "List course files",
-    description: "List files available in a Quercus course.",
+    description:
+      "List files available in a Quercus course. Works even when the course's Files tab is hidden: " +
+      "also collects files published through Modules and files linked from pages and the syllabus. " +
+      "Each file's `found_via` says where it came from (files_index, module, page_link, syllabus_link).",
     inputSchema: {
       course_id: z.string(),
     },
   },
   async ({ course_id }) => {
-    const files = await canvasGet(`/courses/${course_id}/files`, { params: { per_page: 100 } });
-    return { content: [{ type: "text", text: JSON.stringify(files, null, 2) }] };
+    const found = new Map<string, ReturnType<typeof slimFile>>();
+    const notes: string[] = [];
+
+    // 1. Files index
+    const index = await tryGet(() =>
+      canvasGet<any>(`/courses/${course_id}/files`, { params: { per_page: 100 }, maxPages: 20 })
+    );
+    if (index) {
+      for (const f of index) found.set(String(f.id), slimFile(f, "files_index"));
+    } else {
+      notes.push("Files tab is hidden for this course; used modules and page links instead.");
+    }
+
+    // 2. Modules
+    const modules =
+      (await tryGet(() =>
+        canvasGet<any>(`/courses/${course_id}/modules`, {
+          params: { include: ["items"], per_page: 100 },
+          maxPages: 20,
+        })
+      )) ?? [];
+
+    const fileItems: { id: string; module: string }[] = [];
+    const pageSlugs = new Set<string>();
+    for (const mod of modules) {
+      // Canvas leaves `items` out when a module has too many; fetch them directly.
+      let items: any[] | null = mod.items ?? null;
+      if (!items) {
+        items = await tryGet(() =>
+          canvasGet<any>(`/courses/${course_id}/modules/${mod.id}/items`, {
+            params: { per_page: 100 },
+            maxPages: 20,
+          })
+        );
+      }
+      for (const item of items ?? []) {
+        if (item.type === "File" && item.content_id != null) {
+          fileItems.push({ id: String(item.content_id), module: mod.name });
+        } else if (item.type === "Page" && item.page_url) {
+          pageSlugs.add(item.page_url);
+        }
+      }
+    }
+
+    // 3. Page bodies and the syllabus
+    const linked: { id: string; owner: string; via: string }[] = [];
+    const scan = (html: string | null | undefined, via: string) => {
+      for (const m of (html ?? "").matchAll(FILE_LINK)) {
+        linked.push({ id: m[2], owner: m[1] ?? course_id, via });
+      }
+    };
+
+    const pageIndex = await tryGet(() =>
+      canvasGet<any>(`/courses/${course_id}/pages`, { params: { per_page: 100 }, maxPages: 20 })
+    );
+    for (const p of pageIndex ?? []) if (p.url) pageSlugs.add(p.url);
+    const front = await tryGet(() => canvasGetOne<any>(`/courses/${course_id}/front_page`));
+    if (front) scan(front.body, "page_link");
+
+    const pages = await mapLimit([...pageSlugs], 6, (slug) =>
+      tryGet(() => canvasGetOne<any>(`/courses/${course_id}/pages/${encodeURIComponent(slug)}`))
+    );
+    for (const p of pages) if (p) scan(p.body, "page_link");
+
+    const course = await tryGet(() =>
+      canvasGetOne<any>(`/courses/${course_id}`, { params: { include: ["syllabus_body"] } })
+    );
+    if (course) scan(course.syllabus_body, "syllabus_link");
+
+    // Resolve everything not already known from the index.
+    const pending = new Map<string, { owner: string; via: string; module?: string }>();
+    for (const it of fileItems) {
+      if (!found.has(it.id) && !pending.has(it.id)) {
+        pending.set(it.id, { owner: course_id, via: "module", module: it.module });
+      }
+    }
+    for (const l of linked) {
+      if (!found.has(l.id) && !pending.has(l.id)) pending.set(l.id, { owner: l.owner, via: l.via });
+    }
+
+    let unavailable = 0;
+    await mapLimit([...pending.entries()], 6, async ([fid, info]) => {
+      const obj =
+        (await tryGet(() => canvasGetOne<any>(`/courses/${info.owner}/files/${fid}`))) ??
+        (await tryGet(() => canvasGetOne<any>(`/files/${fid}`)));
+      if (obj) found.set(fid, slimFile(obj, info.via, info.module));
+      else unavailable++;
+    });
+    if (unavailable) notes.push(`${unavailable} linked file(s) were locked or unavailable and were skipped.`);
+
+    const files = [...found.values()];
+    const result = { course_id, count: files.length, notes, files };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 

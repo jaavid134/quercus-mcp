@@ -82,3 +82,71 @@ export async function canvasGetOne<T = unknown>(path: string, options: CanvasReq
   }
   return (await res.json()) as T;
 }
+
+export interface DownloadedFile {
+  bytes: Uint8Array;
+  contentType: string | null;
+}
+
+/**
+ * Downloads a file's bytes from the `url` Canvas reports for it. Canvas answers with a redirect to its
+ * file-storage host, so redirects are followed by hand: the token is only ever sent to the Quercus host.
+ */
+export async function canvasDownload(fileUrl: string, maxBytes: number): Promise<DownloadedFile> {
+  let url = new URL(fileUrl);
+
+  for (let hop = 0; hop < 6; hop++) {
+    const sameHost = url.origin === BASE_ORIGIN;
+    if (url.protocol !== "https:" && !sameHost) {
+      throw new Error(`refusing to download over ${url.protocol}//`);
+    }
+
+    const res = await fetch(url, {
+      headers: sameHost ? { Authorization: `Bearer ${TOKEN}` } : {},
+      redirect: "manual",
+    });
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("Location");
+      await res.body?.cancel();
+      if (!location) throw new Error(`redirect (${res.status}) without a Location header`);
+      url = new URL(location, url);
+      continue;
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+
+    const tooLarge = () => new Error(`file is larger than the ${Math.round(maxBytes / 1024 / 1024)} MB limit`);
+    if (Number(res.headers.get("Content-Length") ?? 0) > maxBytes) {
+      await res.body?.cancel();
+      throw tooLarge();
+    }
+    if (!res.body) throw new Error("empty response");
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { bytes, contentType: res.headers.get("Content-Type") };
+  }
+
+  throw new Error("too many redirects");
+}

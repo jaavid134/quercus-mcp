@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "fflate": "^0.8.3",
     "unpdf": "^1.9.1",
     "zod": "^3.24.1"
   },
